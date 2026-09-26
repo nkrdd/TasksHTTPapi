@@ -18,11 +18,6 @@ import (
 )
 
 func main() {
-	clientCertificate, err := tls.LoadX509KeyPair("certs/client.crt", "certs/client.key")
-	if err != nil {
-		log.Printf("load client certificate: %v\n", err)
-		return
-	}
 	
 	caPEM, err := os.ReadFile("certs/ca.crt")
 	if err != nil {
@@ -39,7 +34,6 @@ func main() {
 	}
 
 	tlsConfig := tls.Config{
-		Certificates: []tls.Certificate{clientCertificate},
 		RootCAs: certCAPool,
 		ServerName: "localhost",
 	}	

@@ -317,6 +317,30 @@ func authStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServe
 	return handler(srv, ss)
 }
 
+func newGRPCServer(tc credentials.TransportCredentials) *grpc.Server {
+	interceptor := grpc.ChainUnaryInterceptor(loggingInterceptor, authInterceptor)
+	streamInterceptor := grpc.ChainStreamInterceptor(loggingStreamInterceptor, authStreamInterceptor) 
+
+	tasks := []*taskspb.Task{
+		{Id: 1, Title: "learn golang", Done: false},
+		{Id: 2, Title: "learn grpc", Done: false},
+		{Id: 3, Title: "learn html", Done: true},
+	}
+	
+	server := grpc.NewServer(interceptor, streamInterceptor, grpc.Creds(tc))
+
+	ts := &TaskServer{tasks: tasks, nextID: 4}
+	taskspb.RegisterTaskServiceServer(server, ts)
+
+	hs := health.NewServer()
+	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+
+	grpc_health_v1.RegisterHealthServer(server, hs)	
+	reflection.Register(server)
+
+	return server
+}
+
 func main() {
 	listener, err := net.Listen("tcp", ":50051")
 	if err != nil {
@@ -355,24 +379,8 @@ func main() {
 	}
 	
 	tc := credentials.NewTLS(tlsConfig)
-
-	interceptor := grpc.ChainUnaryInterceptor(loggingInterceptor, authInterceptor)
-	streamInterceptor := grpc.ChainStreamInterceptor(loggingStreamInterceptor, authStreamInterceptor) 
-	server := grpc.NewServer(interceptor, streamInterceptor, grpc.Creds(tc))
-
-	tasks := []*taskspb.Task{
-		{Id: 1, Title: "learn golang", Done: false},
-		{Id: 2, Title: "learn grpc", Done: false},
-		{Id: 3, Title: "learn html", Done: true},
-	}
-
-	ts := &TaskServer{tasks: tasks, nextID: 4}
-	taskspb.RegisterTaskServiceServer(server, ts)
-	hs := health.NewServer()
-	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
-	grpc_health_v1.RegisterHealthServer(server, hs)
 	
-	reflection.Register(server)
+	server := newGRPCServer(tc)
 
 	go func() {
 		if err := server.Serve(listener); err != nil {
