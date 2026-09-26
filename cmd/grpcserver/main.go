@@ -317,6 +317,35 @@ func authStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServe
 	return handler(srv, ss)
 }
 
+func loadServerTLSCredentials(certPath, keyPath, caPath string) (credentials.TransportCredentials, error) {
+	serverCert, err := tls.LoadX509KeyPair(
+		certPath,
+		keyPath,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load server certificate: %w", err)
+	}
+
+	caPEM, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("read CA certificate: %w", err) 
+	}
+
+	clientCAs := x509.NewCertPool()
+
+	if ok := clientCAs.AppendCertsFromPEM(caPEM); !ok {
+		return nil, fmt.Errorf("append CA certificate error")
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs: clientCAs,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+	}
+	
+	return credentials.NewTLS(tlsConfig), nil
+}
+
 func newGRPCServer(tc credentials.TransportCredentials) *grpc.Server {
 	interceptor := grpc.ChainUnaryInterceptor(loggingInterceptor, authInterceptor)
 	streamInterceptor := grpc.ChainStreamInterceptor(loggingStreamInterceptor, authStreamInterceptor) 
@@ -342,6 +371,14 @@ func newGRPCServer(tc credentials.TransportCredentials) *grpc.Server {
 }
 
 func main() {
+	tc, err := loadServerTLSCredentials("certs/server.crt", "certs/server.key", "certs/ca.crt")
+	if err != nil {
+		log.Printf("load server tls credentials: %v", err)
+		return
+	}
+
+	server := newGRPCServer(tc)
+
 	listener, err := net.Listen("tcp", ":50051")
 	if err != nil {
 		log.Printf("create listener: %v", err)
@@ -350,37 +387,6 @@ func main() {
 
 	sigChan := make(chan os.Signal, 1)
 	
-	serverCert, err := tls.LoadX509KeyPair(
-		"certs/server.crt",
-		"certs/server.key",
-	)
-	if err != nil {
-		log.Printf("load server certificate: %v\n", err)
-		return
-	}
-
-	caPEM, err := os.ReadFile("certs/ca.crt")
-	if err != nil {
-		log.Printf("read ca certificate: %v\n", err)
-		return
-	}
-
-	clientCAs := x509.NewCertPool()
-
-	if ok := clientCAs.AppendCertsFromPEM(caPEM); !ok {
-		log.Printf("failed to append CA certificate\n")
-		return
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{serverCert},
-		ClientCAs: clientCAs,
-		ClientAuth: tls.RequireAndVerifyClientCert,
-	}
-	
-	tc := credentials.NewTLS(tlsConfig)
-	
-	server := newGRPCServer(tc)
 
 	go func() {
 		if err := server.Serve(listener); err != nil {
