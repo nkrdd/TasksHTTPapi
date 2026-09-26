@@ -1,0 +1,59 @@
+syntax = "proto3"; 
+
+package tasks;
+option go_package = "tasks/proto;taskspb";
+
+message Task {
+  int64 id = 1;
+  string title = 2;
+  bool done = 3;
+}
+
+message GetTaskRequest {
+  int64 id = 1;
+}
+
+message CreateTaskRequest {
+  string title = 1;
+  bool done = 2;
+}
+
+message ListTaskRequest {
+}
+
+message ListTaskResponse {
+  repeated Task tasks = 1;
+}
+
+message UpdateTaskRequest {
+  int64 id = 1;
+  optional string title = 2;
+  optional bool done = 3;
+}
+
+message DeleteTaskRequest {
+  int64 id = 1;
+}
+
+message WatchTaskRequest {}
+
+message UploadTasksResponse {
+  int32 processed = 1;
+}
+
+message TaskResult {
+  int64 id = 1;
+  string message = 2;
+}
+
+service TaskService {
+  rpc GetTask (GetTaskRequest) returns (Task);
+  rpc CreateTask(CreateTaskRequest) returns (Task);
+  rpc ListTasks(ListTaskRequest) returns (ListTaskResponse);
+  rpc UpdateTask(UpdateTaskRequest) returns (Task);
+  rpc DeleteTask(DeleteTaskRequest) returns (Task);
+  
+  rpc WatchTasks(WatchTaskRequest) returns (stream Task);
+  rpc UploadTasks(stream Task) returns (UploadTasksResponse);
+  rpc SyncTasks(stream Task) returns (stream TaskResult);
+}
