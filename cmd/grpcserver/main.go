@@ -34,6 +34,28 @@ type TaskServer struct {
 	nextID int64
 }
 
+var clientPool = map[string]map[string]struct{}{
+    "client1": {
+        taskspb.TaskService_GetTask_FullMethodName:    {},
+        taskspb.TaskService_CreateTask_FullMethodName: {},
+		taskspb.TaskService_ListTasks_FullMethodName: {},
+		taskspb.TaskService_UpdateTask_FullMethodName: {}, 
+		taskspb.TaskService_WatchTasks_FullMethodName: {},
+		taskspb.TaskService_UploadTasks_FullMethodName: {},
+		taskspb.TaskService_SyncTasks_FullMethodName: {},
+    },
+    "client2": {
+        taskspb.TaskService_GetTask_FullMethodName:    {},
+        taskspb.TaskService_CreateTask_FullMethodName: {},
+        taskspb.TaskService_DeleteTask_FullMethodName: {},
+		taskspb.TaskService_ListTasks_FullMethodName: {},
+		taskspb.TaskService_UpdateTask_FullMethodName: {}, 
+		taskspb.TaskService_WatchTasks_FullMethodName: {},
+		taskspb.TaskService_UploadTasks_FullMethodName: {},
+		taskspb.TaskService_SyncTasks_FullMethodName: {},
+    },
+}
+
 func (s *TaskServer) findTaskByID(id int64) (*taskspb.Task, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -193,32 +215,39 @@ func (s *TaskServer) SyncTasks(stream grpc.BidiStreamingServer[taskspb.Task, tas
 	}
 }
 
+func checkAccess(ctx context.Context, method string) error {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return status.Error(codes.Unauthenticated, "metadata not found")
+	}
+
+	auth := md.Get("authorization")
+	if len(auth) == 0 {
+		return status.Error(codes.Unauthenticated, "auth token not found")
+	}
+	if auth[0] != "sfadfsf3423fdas2" {
+		return status.Error(codes.Unauthenticated, "not expected auth token")
+	}
+
+	commonName, err := getCommonName(ctx)
+	if err != nil {
+		return status.Error(codes.Unauthenticated, "cant identify client personality")
+	}
+
+	if !canCall(commonName, method) {
+		return status.Error(codes.PermissionDenied, fmt.Sprintf("%s cant call %s", commonName, method))
+	}
+
+	return nil
+}
+
 func authInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	if info.FullMethod == grpc_health_v1.Health_Check_FullMethodName {
 		return handler(ctx, req)
 	}
 
-
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return nil, status.Error(codes.Unauthenticated, "metadata not found")
-	}
-
-	auth := md.Get("authorization")
-	if len(auth) == 0 {
-		return nil, status.Error(codes.Unauthenticated, "auth token not found")
-	}
-	if auth[0] != "sfadfsf3423fdas2" {
-		return nil, status.Error(codes.Unauthenticated, "not expected auth token")
-	}
-
-	commonName, err := getCommonName(ctx)
-	if err != nil {
-		return nil, status.Error(codes.Unauthenticated, "cant identify client personality")
-	}
-
-	if commonName == "client1" && info.FullMethod == taskspb.TaskService_DeleteTask_FullMethodName {
-		return nil, status.Error(codes.PermissionDenied, "client1 cant call DeleteTask method")
+	if err := checkAccess(ctx, info.FullMethod); err != nil {
+		return nil, err
 	}
 
 	return handler(ctx, req)
@@ -301,18 +330,9 @@ func authStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServe
 		return handler(srv, ss)
 	}
 
-	md, ok := metadata.FromIncomingContext(ss.Context())
-	if !ok {
-		return status.Error(codes.Unauthenticated, "metadata not found")
+	if err := checkAccess(ss.Context(), info.FullMethod); err != nil {
+		return err
 	}
-
-	auth := md.Get("authorization")
-	if len(auth) == 0 {
-		return status.Error(codes.Unauthenticated, "auth token not found")
-	}
-	if auth[0] != "sfadfsf3423fdas2" {
-		return status.Error(codes.Unauthenticated, "not expected auth token")
-	} 
 
 	return handler(srv, ss)
 }
@@ -368,6 +388,15 @@ func newGRPCServer(tc credentials.TransportCredentials) *grpc.Server {
 	reflection.Register(server)
 
 	return server
+}
+
+func canCall(clientID, method string) bool {	
+	if clientRights, ok := clientPool[clientID]; ok {
+		_, allowed := clientRights[method]
+		return allowed 	
+	}
+
+	return false
 }
 
 func main() {

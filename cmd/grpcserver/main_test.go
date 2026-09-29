@@ -212,3 +212,136 @@ func TestAuthInterceptor_SuccessClient2(t *testing.T) {
 		t.Fatalf("handler must be called")
 	}
 }
+
+func TestCanCallFunc_Client1(t *testing.T) {
+	if !canCall("client1", taskspb.TaskService_GetTask_FullMethodName) {
+		t.Fatalf("client1 can call get task method!")
+	}
+
+	if canCall("client1", taskspb.TaskService_DeleteTask_FullMethodName) {
+		t.Fatalf("client1 cant call delete method")
+	}
+
+	if !canCall("client1", taskspb.TaskService_CreateTask_FullMethodName) {
+		t.Fatalf("client1 can call create task method")
+	}
+}
+
+func TestCanCallFunc_Client2(t *testing.T) {
+	if !canCall("client2", taskspb.TaskService_GetTask_FullMethodName) {
+		t.Fatalf("client2 can call get task method!")
+	}
+
+	if !canCall("client2", taskspb.TaskService_DeleteTask_FullMethodName) {
+		t.Fatalf("client2 can call delete method")
+	}
+
+	if !canCall("client2", taskspb.TaskService_CreateTask_FullMethodName) {
+		t.Fatalf("client2 can call create task method")
+	}
+}
+
+func TestCanCallFunc_Client3(t *testing.T) {
+	if canCall("client3", taskspb.TaskService_GetTask_FullMethodName) {
+		t.Fatalf("client3 cant call get task method")
+	}
+}
+
+func TestCanCallFunc_Client2_NotExistMethod(t *testing.T) {
+	if canCall("client2", "lol") {
+		t.Fatalf("cant call not exist rpc")
+	}
+}
+
+type testServerStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *testServerStream) Context() context.Context {
+	return s.ctx
+}
+
+func TestAuthStreamInterceptor_PermDenied(t *testing.T) {
+	cert := &x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "client3",
+		},
+	}
+
+	connState := tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+	authInfo := credentials.TLSInfo{State: connState}
+	p := peer.Peer{AuthInfo: authInfo}
+	ctx := peer.NewContext(context.Background(), &p)
+	md := metadata.Pairs(
+		"authorization", "sfadfsf3423fdas2",
+	)
+
+	ctx = metadata.NewIncomingContext(ctx, md) 
+	info := &grpc.StreamServerInfo{
+		FullMethod: taskspb.TaskService_WatchTasks_FullMethodName,
+	}
+	
+	called := false
+	
+	handler := func(srv any, ss grpc.ServerStream) error {
+		called = true
+		return nil
+	}
+	
+	ss := testServerStream{
+		ctx: ctx,
+	}
+
+	err := authStreamInterceptor(nil, &ss, info, handler)
+
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+
+	if called {
+		t.Fatalf("handler must not be called")
+	}
+}
+
+func TestAuthStreamInterceptor_Success(t *testing.T) {
+	cert := &x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "client2",
+		},
+	}
+
+	connState := tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+	authInfo := credentials.TLSInfo{State: connState}
+	p := peer.Peer{AuthInfo: authInfo}
+	ctx := peer.NewContext(context.Background(), &p)
+	md := metadata.Pairs(
+		"authorization", "sfadfsf3423fdas2",
+	)
+
+	ctx = metadata.NewIncomingContext(ctx, md) 
+	info := &grpc.StreamServerInfo{
+		FullMethod: taskspb.TaskService_WatchTasks_FullMethodName,
+	}
+	
+	called := false
+	
+	handler := func(srv any, ss grpc.ServerStream) error {
+		called = true
+		return nil
+	}
+	
+	ss := testServerStream{
+		ctx: ctx,
+	}
+
+	err := authStreamInterceptor(nil, &ss, info, handler)
+
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+
+	if !called {
+		t.Fatalf("handler must be called")
+	}
+}
