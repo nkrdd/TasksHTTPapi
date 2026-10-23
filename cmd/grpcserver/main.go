@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"tasks/internal/logger"
 	taskspb "tasks/proto"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -275,54 +278,149 @@ func getCommonName(ctx context.Context) (string, error) {
 	return commonName, nil
 }
 
-func loggingInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	requestIDString := ""
-	commonName := ""
-	start := time.Now()
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		log.Printf("metadata not found\n")
-	}
+type requestIDKey struct{}
 
-	requestID := md.Get("request-id")
-	if len(requestID) > 0 {
-		requestIDString = requestID[0]
-	}
+func requestIDInterceptor() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		var requestID string
 
-	commonName, err := getCommonName(ctx)
-	if err != nil {
-		log.Printf("get common name: %v", err)
-	}
+		md, _ := metadata.FromIncomingContext(ctx)
+		ids := md.Get("request-id")
 
-	resp, err := handler(ctx, req)
-	duration := time.Since(start)
-	method := info.FullMethod
-	log.Printf("method=%s duration=%s error=%v request-id=%s commonName:%s\n", method, duration, err, requestIDString, commonName)
-	return resp, err
+		if len(ids) > 0 && ids[0] != "" {
+			requestID = ids[0]
+		} else {
+			requestID = uuid.NewString()
+		}
+		
+		ctx = context.WithValue(ctx, requestIDKey{}, requestID)
+
+		return handler(ctx, req)
+	}
 }
 
-func loggingStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	requestIDString := ""
-	start := time.Now()
-	md, ok := metadata.FromIncomingContext(ss.Context())
-	if !ok {
-		log.Printf("no metadata\n")
-	}
+type wrappedServerStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
 
-	requestID := md.Get("request-id")
-	if len(requestID) > 0 {
-		requestIDString = requestID[0]
-	}
-	
-	commonName, err := getCommonName(ss.Context())
-	if err != nil {
-		log.Printf("get common name: %v", err)
-	}
+func (w *wrappedServerStream) Context() context.Context {
+	return w.ctx
+}
 
-	err = handler(srv, ss)
-	duration := time.Since(start)
-	log.Printf("method=%s duration=%s error=%v is_client_stream=%t is_server_stream=%t request-id=%s commonName=%s\n", info.FullMethod, duration, err, info.IsClientStream, info.IsServerStream, requestIDString, commonName)
-	return err
+func requestIDStreamInterceptor() grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		ctx := ss.Context()
+		
+		var requestID string
+		md, _ := metadata.FromIncomingContext(ctx)
+		ids := md.Get("request-id")
+
+		if len(ids) > 0 && ids[0] != "" {
+			requestID = ids[0]
+		} else {
+			requestID = uuid.NewString()
+		}
+
+		ctx = context.WithValue(ctx, requestIDKey{}, requestID)
+		
+		newSS := &wrappedServerStream{
+			ServerStream: ss,
+			ctx : ctx,
+		}
+
+		return handler(srv, newSS)
+	}
+}
+
+func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		start := time.Now()
+
+		requestIDString, ok := ctx.Value(requestIDKey{}).(string)
+		if !ok {
+			logger.Warn("get request id error")
+		}
+
+		commonName, err := getCommonName(ctx)
+		if err != nil {
+			logger.Error("get common name", slog.Any("error", err)) 
+		}
+
+		resp, err := handler(ctx, req)
+		grpcCode := status.Code(err)
+		duration := time.Since(start)
+		method := info.FullMethod
+		
+		level := slog.LevelInfo
+		msg := "rpc completed"
+		
+		attrs := []slog.Attr{
+			slog.String("method", method),
+			slog.Duration("duration", duration),
+			slog.String("request_id", requestIDString),
+			slog.String("common_name", commonName),
+			slog.String("grpc_code", grpcCode.String()),
+		}
+		
+		if err != nil {
+			level = slog.LevelError
+			msg = "rpc failed"
+
+			attrs = append(attrs, slog.Any("error", err))
+		} 
+		
+		logger.LogAttrs(ctx, level, msg, attrs...)
+
+		return resp, err
+	}
+}
+
+func loggingStreamInterceptor(logger *slog.Logger) grpc.StreamServerInterceptor {
+	return func (srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		start := time.Now()
+		
+		requestIDString, ok := ss.Context().Value(requestIDKey{}).(string)
+		if !ok {
+			logger.Warn("get request id error")
+		}
+
+		commonName, err := getCommonName(ss.Context())
+		if err != nil {
+			logger.Warn("get common name", slog.Any("error", err))
+		}
+			
+		err = handler(srv, ss)
+		method := info.FullMethod
+		isClientStream := info.IsClientStream
+		IsServerStream := info.IsServerStream
+		grpcCode := status.Code(err)
+		duration := time.Since(start)
+
+		level := slog.LevelInfo
+		msg := "rpc completed"
+
+		attrs := []slog.Attr{
+			slog.String("method", method),
+			slog.Duration("duration", duration),
+			slog.String("request_id", requestIDString),
+			slog.String("common_name", commonName),
+			slog.Bool("is_client_stream", isClientStream),
+			slog.Bool("is_server_stream", IsServerStream),
+			slog.String("grpc_code", grpcCode.String()),
+		}
+
+		if err != nil {
+			level = slog.LevelError
+			msg = "rpc failed"
+
+			attrs = append(attrs, slog.Any("error", err))
+		}
+
+		logger.LogAttrs(ss.Context(), level, msg, attrs...)
+
+		return err
+	}
 }
 
 func authStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
@@ -366,9 +464,9 @@ func loadServerTLSCredentials(certPath, keyPath, caPath string) (credentials.Tra
 	return credentials.NewTLS(tlsConfig), nil
 }
 
-func newGRPCServer(tc credentials.TransportCredentials) *grpc.Server {
-	interceptor := grpc.ChainUnaryInterceptor(loggingInterceptor, authInterceptor)
-	streamInterceptor := grpc.ChainStreamInterceptor(loggingStreamInterceptor, authStreamInterceptor) 
+func newGRPCServer(tc credentials.TransportCredentials, logger *slog.Logger) *grpc.Server {
+	interceptor := grpc.ChainUnaryInterceptor(requestIDInterceptor(), loggingInterceptor(logger), authInterceptor)
+	streamInterceptor := grpc.ChainStreamInterceptor(requestIDStreamInterceptor(), loggingStreamInterceptor(logger), authStreamInterceptor) 
 
 	tasks := []*taskspb.Task{
 		{Id: 1, Title: "learn golang", Done: false},
@@ -400,13 +498,15 @@ func canCall(clientID, method string) bool {
 }
 
 func main() {
+	serverLogger := logger.New("server")
+
 	tc, err := loadServerTLSCredentials("certs/server.crt", "certs/server.key", "certs/ca.crt")
 	if err != nil {
 		log.Printf("load server tls credentials: %v", err)
 		return
 	}
 
-	server := newGRPCServer(tc)
+	server := newGRPCServer(tc, serverLogger)
 
 	listener, err := net.Listen("tcp", ":50051")
 	if err != nil {

@@ -11,7 +11,7 @@ import (
 	taskspb "tasks/proto"
 	"testing"
 	"time"
-
+	"tasks/internal/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -26,8 +26,9 @@ func startTestServer(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("load server tls credentials failed: %v", err)
 	}
-
-	server := newGRPCServer(tc)
+	
+	testLogger := logger.New("test")
+	server := newGRPCServer(tc, testLogger)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
