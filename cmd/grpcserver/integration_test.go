@@ -28,7 +28,7 @@ func startTestServer(t *testing.T) string {
 	}
 	
 	testLogger := logger.New("test")
-	server := newGRPCServer(tc, testLogger)
+	server := newGRPCServer(tc, testLogger, nil)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

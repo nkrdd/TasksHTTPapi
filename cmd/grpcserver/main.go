@@ -4,9 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"os"
@@ -14,10 +14,13 @@ import (
 	"sync"
 	"syscall"
 	"tasks/internal/logger"
+	"tasks/internal/storage"
 	taskspb "tasks/proto"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -32,31 +35,49 @@ import (
 
 type TaskServer struct {
 	taskspb.UnimplementedTaskServiceServer
-	mu sync.RWMutex
-	tasks []*taskspb.Task
+	store taskStore
+	mu     sync.RWMutex
+	tasks  []*taskspb.Task
 	nextID int64
 }
 
+type taskStore interface {
+	GetByID(ctx context.Context, id int64) (storage.Task, error)
+	Create(ctx context.Context, title string, done bool) (storage.Task, error)
+	List(ctx context.Context) ([]storage.Task, error)
+	Update(ctx context.Context, id int64, title *string, done *bool) (storage.Task, error)
+}
+
 var clientPool = map[string]map[string]struct{}{
-    "client1": {
-        taskspb.TaskService_GetTask_FullMethodName:    {},
-        taskspb.TaskService_CreateTask_FullMethodName: {},
-		taskspb.TaskService_ListTasks_FullMethodName: {},
-		taskspb.TaskService_UpdateTask_FullMethodName: {}, 
-		taskspb.TaskService_WatchTasks_FullMethodName: {},
+	"client1": {
+		taskspb.TaskService_GetTask_FullMethodName:     {},
+		taskspb.TaskService_CreateTask_FullMethodName:  {},
+		taskspb.TaskService_ListTasks_FullMethodName:   {},
+		taskspb.TaskService_UpdateTask_FullMethodName:  {},
+		taskspb.TaskService_WatchTasks_FullMethodName:  {},
 		taskspb.TaskService_UploadTasks_FullMethodName: {},
-		taskspb.TaskService_SyncTasks_FullMethodName: {},
-    },
-    "client2": {
-        taskspb.TaskService_GetTask_FullMethodName:    {},
-        taskspb.TaskService_CreateTask_FullMethodName: {},
-        taskspb.TaskService_DeleteTask_FullMethodName: {},
-		taskspb.TaskService_ListTasks_FullMethodName: {},
-		taskspb.TaskService_UpdateTask_FullMethodName: {}, 
-		taskspb.TaskService_WatchTasks_FullMethodName: {},
+		taskspb.TaskService_SyncTasks_FullMethodName:   {},
+	},
+	"client2": {
+		taskspb.TaskService_GetTask_FullMethodName:     {},
+		taskspb.TaskService_CreateTask_FullMethodName:  {},
+		taskspb.TaskService_DeleteTask_FullMethodName:  {},
+		taskspb.TaskService_ListTasks_FullMethodName:   {},
+		taskspb.TaskService_UpdateTask_FullMethodName:  {},
+		taskspb.TaskService_WatchTasks_FullMethodName:  {},
 		taskspb.TaskService_UploadTasks_FullMethodName: {},
-		taskspb.TaskService_SyncTasks_FullMethodName: {},
-    },
+		taskspb.TaskService_SyncTasks_FullMethodName:   {},
+	},
+}
+
+var grpcLogLevels = map[codes.Code]slog.Level{
+	codes.OK:              slog.LevelInfo,
+	codes.InvalidArgument: slog.LevelWarn,
+	codes.NotFound:        slog.LevelInfo,
+	codes.Canceled:        slog.LevelInfo,
+	codes.Internal:        slog.LevelError,
+	codes.Unavailable:     slog.LevelError,
+	codes.Unknown:         slog.LevelError,
 }
 
 func (s *TaskServer) findTaskByID(id int64) (*taskspb.Task, bool) {
@@ -71,45 +92,57 @@ func (s *TaskServer) findTaskByID(id int64) (*taskspb.Task, bool) {
 	return nil, false
 }
 
-func (s *TaskServer) GetTask(ctx context.Context, req *taskspb.GetTaskRequest) (*taskspb.Task, error) {	
+func (s *TaskServer) GetTask(ctx context.Context, req *taskspb.GetTaskRequest) (*taskspb.Task, error) {
 	id := req.Id
-	
+
 	if id <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "id must be positive")
 	}
-	
-	task, ok := s.findTaskByID(id)
-	if !ok {
-		return nil, status.Error(codes.NotFound, "task with this id not found")
+
+	task, err := s.store.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, status.Error(codes.NotFound, "task not found")
+		}
+		return nil, status.Error(codes.Internal, "get task internal error")
 	}
-	
-	return task, nil
+
+	return &taskspb.Task{
+		Id:    task.ID,
+		Title: task.Title,
+		Done:  task.Done,
+	}, nil
 }
 
 func (s *TaskServer) CreateTask(ctx context.Context, req *taskspb.CreateTaskRequest) (*taskspb.Task, error) {
 	title, done := req.Title, req.Done
-	
+
 	if title == "" {
 		return nil, status.Error(codes.InvalidArgument, "title cant be empty")
 	}
+	
+	task, err := s.store.Create(ctx, title, done)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "create task in db error")
+	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := s.nextID
-	newTask := &taskspb.Task{Id: id, Title: title, Done: done}
-	s.tasks = append(s.tasks, newTask)
-	s.nextID++
-	return &taskspb.Task{Id: newTask.Id, Title: newTask.Title, Done: newTask.Done}, nil
+	createdTask := &taskspb.Task{Id: task.ID, Title: task.Title, Done: task.Done}
+	return createdTask, nil
 }
 
 func (s *TaskServer) ListTasks(ctx context.Context, req *taskspb.ListTaskRequest) (*taskspb.ListTaskResponse, error) {
-	s.mu.RLock()
-	tasks := make([]*taskspb.Task, 0, len(s.tasks))
-	defer s.mu.RUnlock()
-	for _, task := range s.tasks {
-		tasks = append(tasks, &taskspb.Task{Id: task.Id, Title: task.Title, Done: task.Done})
+	tasks, err := s.store.List(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "storage error while list task func")
 	}
-	return &taskspb.ListTaskResponse{Tasks: tasks}, nil
+	
+	resp := &taskspb.ListTaskResponse{Tasks: make([]*taskspb.Task, 0, len(tasks))}
+	
+	for _, task := range tasks {
+		resp.Tasks = append(resp.Tasks, &taskspb.Task{Id: task.ID, Title: task.Title, Done: task.Done})	
+	}
+
+	return resp, nil
 }
 
 func (s *TaskServer) UpdateTask(ctx context.Context, req *taskspb.UpdateTaskRequest) (*taskspb.Task, error) {
@@ -124,21 +157,16 @@ func (s *TaskServer) UpdateTask(ctx context.Context, req *taskspb.UpdateTaskRequ
 	if req.Title != nil && *req.Title == "" {
 		return nil, status.Error(codes.InvalidArgument, "title must be not empty")
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, task := range s.tasks {
-		if task.Id == req.Id {
-			if req.Title != nil {
-				task.Title = *req.Title
-			}
-			if req.Done != nil {
-				task.Done = *req.Done
-			}
-			return &taskspb.Task{Id: task.Id, Title: task.Title, Done: task.Done}, nil
+	
+	updatedTask, err := s.store.Update(ctx, req.Id, req.Title, req.Done)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil,	status.Error(codes.NotFound, "task with this id not found")
 		}
+		return nil, status.Error(codes.Internal, "unexpected error") 
 	}
-	return nil, status.Error(codes.NotFound, "task with this id not found")
+	
+	return &taskspb.Task{Id: updatedTask.ID, Title: updatedTask.Title, Done: updatedTask.Done}, nil
 }
 
 func (s *TaskServer) DeleteTask(ctx context.Context, req *taskspb.DeleteTaskRequest) (*taskspb.Task, error) {
@@ -165,13 +193,11 @@ func (s *TaskServer) WatchTasks(req *taskspb.WatchTaskRequest, stream grpc.Serve
 		tasks = append(tasks, &taskspb.Task{Id: task.Id, Title: task.Title, Done: task.Done})
 	}
 	s.mu.RUnlock()
-	
+
 	for _, task := range tasks {
 		if err := stream.Send(task); err != nil {
-			log.Printf("send to the stream: %v", err)
 			return err
 		}
-		log.Printf("task: %d id has been sent", task.Id)
 	}
 	return nil
 }
@@ -184,17 +210,14 @@ func (s *TaskServer) UploadTasks(stream grpc.ClientStreamingServer[taskspb.Task,
 			if err == io.EOF {
 				err := stream.SendAndClose(&taskspb.UploadTasksResponse{Processed: processed})
 				if err != nil {
-					log.Printf("send and close stream: %v\n", err)
 					return err
 				}
-				log.Printf("stream has been ended\n")
 				return nil
 			}
-			log.Printf("receive task from client: %v\n", err)
 			return err
 		}
 		processed++
-	}	
+	}
 }
 
 func (s *TaskServer) SyncTasks(stream grpc.BidiStreamingServer[taskspb.Task, taskspb.TaskResult]) error {
@@ -202,19 +225,15 @@ func (s *TaskServer) SyncTasks(stream grpc.BidiStreamingServer[taskspb.Task, tas
 		task, err := stream.Recv()
 		if err != nil {
 			if err == io.EOF {
-				log.Printf("client stop sending\n")
 				return nil
 			}
-			log.Printf("receive msg from client: %v\n", err)
 			return err
 		}
 		taskResult := taskspb.TaskResult{Id: task.Id, Message: "task received"}
 		err = stream.Send(&taskResult)
 		if err != nil {
-			log.Printf("send task result to stream: %v", err)
 			return err
 		}
-		log.Printf("task result id: %d has been sent\n", taskResult.Id)
 	}
 }
 
@@ -292,7 +311,7 @@ func requestIDInterceptor() grpc.UnaryServerInterceptor {
 		} else {
 			requestID = uuid.NewString()
 		}
-		
+
 		ctx = context.WithValue(ctx, requestIDKey{}, requestID)
 
 		return handler(ctx, req)
@@ -311,7 +330,7 @@ func (w *wrappedServerStream) Context() context.Context {
 func requestIDStreamInterceptor() grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		ctx := ss.Context()
-		
+
 		var requestID string
 		md, _ := metadata.FromIncomingContext(ctx)
 		ids := md.Get("request-id")
@@ -323,10 +342,10 @@ func requestIDStreamInterceptor() grpc.StreamServerInterceptor {
 		}
 
 		ctx = context.WithValue(ctx, requestIDKey{}, requestID)
-		
+
 		newSS := &wrappedServerStream{
 			ServerStream: ss,
-			ctx : ctx,
+			ctx:          ctx,
 		}
 
 		return handler(srv, newSS)
@@ -344,17 +363,21 @@ func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 
 		commonName, err := getCommonName(ctx)
 		if err != nil {
-			logger.Error("get common name", slog.Any("error", err)) 
+			logger.Warn("get common name", slog.Any("error", err))
 		}
 
 		resp, err := handler(ctx, req)
 		grpcCode := status.Code(err)
 		duration := time.Since(start)
 		method := info.FullMethod
-		
-		level := slog.LevelInfo
-		msg := "rpc completed"
-		
+
+		level, ok := grpcLogLevels[grpcCode]
+		if !ok {
+			level = slog.LevelWarn
+		}
+
+		msg := "grpc request completed"
+
 		attrs := []slog.Attr{
 			slog.String("method", method),
 			slog.Duration("duration", duration),
@@ -362,14 +385,11 @@ func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 			slog.String("common_name", commonName),
 			slog.String("grpc_code", grpcCode.String()),
 		}
-		
-		if err != nil {
-			level = slog.LevelError
-			msg = "rpc failed"
 
+		if err != nil {
 			attrs = append(attrs, slog.Any("error", err))
-		} 
-		
+		}
+
 		logger.LogAttrs(ctx, level, msg, attrs...)
 
 		return resp, err
@@ -377,9 +397,9 @@ func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 }
 
 func loggingStreamInterceptor(logger *slog.Logger) grpc.StreamServerInterceptor {
-	return func (srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		start := time.Now()
-		
+
 		requestIDString, ok := ss.Context().Value(requestIDKey{}).(string)
 		if !ok {
 			logger.Warn("get request id error")
@@ -389,16 +409,20 @@ func loggingStreamInterceptor(logger *slog.Logger) grpc.StreamServerInterceptor 
 		if err != nil {
 			logger.Warn("get common name", slog.Any("error", err))
 		}
-			
+
 		err = handler(srv, ss)
 		method := info.FullMethod
 		isClientStream := info.IsClientStream
-		IsServerStream := info.IsServerStream
+		isServerStream := info.IsServerStream
 		grpcCode := status.Code(err)
 		duration := time.Since(start)
 
-		level := slog.LevelInfo
-		msg := "rpc completed"
+		level, ok := grpcLogLevels[grpcCode]
+		if !ok {
+			level = slog.LevelWarn
+		}
+
+		msg := "grpc request completed"
 
 		attrs := []slog.Attr{
 			slog.String("method", method),
@@ -406,14 +430,11 @@ func loggingStreamInterceptor(logger *slog.Logger) grpc.StreamServerInterceptor 
 			slog.String("request_id", requestIDString),
 			slog.String("common_name", commonName),
 			slog.Bool("is_client_stream", isClientStream),
-			slog.Bool("is_server_stream", IsServerStream),
+			slog.Bool("is_server_stream", isServerStream),
 			slog.String("grpc_code", grpcCode.String()),
 		}
 
 		if err != nil {
-			level = slog.LevelError
-			msg = "rpc failed"
-
 			attrs = append(attrs, slog.Any("error", err))
 		}
 
@@ -446,7 +467,7 @@ func loadServerTLSCredentials(certPath, keyPath, caPath string) (credentials.Tra
 
 	caPEM, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil, fmt.Errorf("read CA certificate: %w", err) 
+		return nil, fmt.Errorf("read CA certificate: %w", err)
 	}
 
 	clientCAs := x509.NewCertPool()
@@ -457,88 +478,142 @@ func loadServerTLSCredentials(certPath, keyPath, caPath string) (credentials.Tra
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
-		ClientCAs: clientCAs,
-		ClientAuth: tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
-	
+
 	return credentials.NewTLS(tlsConfig), nil
 }
 
-func newGRPCServer(tc credentials.TransportCredentials, logger *slog.Logger) *grpc.Server {
+func newGRPCServer(tc credentials.TransportCredentials, logger *slog.Logger, storage taskStore) *grpc.Server {
 	interceptor := grpc.ChainUnaryInterceptor(requestIDInterceptor(), loggingInterceptor(logger), authInterceptor)
-	streamInterceptor := grpc.ChainStreamInterceptor(requestIDStreamInterceptor(), loggingStreamInterceptor(logger), authStreamInterceptor) 
+	streamInterceptor := grpc.ChainStreamInterceptor(requestIDStreamInterceptor(), loggingStreamInterceptor(logger), authStreamInterceptor)
 
 	tasks := []*taskspb.Task{
 		{Id: 1, Title: "learn golang", Done: false},
 		{Id: 2, Title: "learn grpc", Done: false},
 		{Id: 3, Title: "learn html", Done: true},
 	}
-	
+
 	server := grpc.NewServer(interceptor, streamInterceptor, grpc.Creds(tc))
 
-	ts := &TaskServer{tasks: tasks, nextID: 4}
+	ts := &TaskServer{tasks: tasks, nextID: 4, store: storage}
 	taskspb.RegisterTaskServiceServer(server, ts)
 
 	hs := health.NewServer()
 	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 
-	grpc_health_v1.RegisterHealthServer(server, hs)	
+	grpc_health_v1.RegisterHealthServer(server, hs)
 	reflection.Register(server)
 
 	return server
 }
 
-func canCall(clientID, method string) bool {	
+func canCall(clientID, method string) bool {
 	if clientRights, ok := clientPool[clientID]; ok {
 		_, allowed := clientRights[method]
-		return allowed 	
+		return allowed
 	}
 
 	return false
 }
 
-func main() {
+func run() error {
 	serverLogger := logger.New("server")
+
+	dbURL := os.Getenv("DATABASE_URL")
+
+	if dbURL == "" {
+		serverLogger.Error("db url is empty")
+		return errors.New("db url is empty")
+	}
+
+	pool, err := pgxpool.New(context.Background(), dbURL)
+	if err != nil {
+		serverLogger.Error(
+			"failed to create connection pool",
+			"error", err,
+		)
+		return err
+	}
+	defer pool.Close()
+
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelPing()
+
+	err = pool.Ping(pingCtx)
+	if err != nil {
+		serverLogger.Error(
+			"failed to ping pool",
+			"error", err,
+		)
+		return err
+	}
+
+	store := storage.New(pool)
 
 	tc, err := loadServerTLSCredentials("certs/server.crt", "certs/server.key", "certs/ca.crt")
 	if err != nil {
-		log.Printf("load server tls credentials: %v", err)
-		return
+		serverLogger.Error(
+			"failed to load server TLS credentials",
+			slog.Any("error", err),
+		)
+		return err
 	}
 
-	server := newGRPCServer(tc, serverLogger)
+	server := newGRPCServer(tc, serverLogger, store)
 
 	listener, err := net.Listen("tcp", ":50051")
 	if err != nil {
-		log.Printf("create listener: %v", err)
-		return
+		serverLogger.Error(
+			"failed to create listener",
+			slog.Any("error", err),
+		)
+		return err
 	}
 
 	sigChan := make(chan os.Signal, 1)
-	
+
+	serveErrch := make(chan error, 1)
+
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
 	go func() {
-		if err := server.Serve(listener); err != nil {
-			log.Printf("serve server and listener: %v\n", err)
-			return
-		}
+		serveErrch <- server.Serve(listener)
 	}()
-	
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	<-sigChan
-	
+	var runErr error
+
+	select {
+	case <-sigChan:
+		serverLogger.Info("shutdown requested")
+	case runErr = <-serveErrch:
+		if runErr == nil {
+			runErr = errors.New("unexpected nil error in serve")
+		}
+		serverLogger.Error("server stopped with unexpected error", slog.Any("error", runErr))
+	}
+
 	done := make(chan struct{}, 1)
 	go func() {
 		server.GracefulStop()
-		done<-struct{}{}
+		done <- struct{}{}
 	}()
 
 	select {
 	case <-done:
-		log.Printf("server has been gracefully stopped\n")
-	case <-time.After(5*time.Second):
-		log.Printf("5 sec is left, stop the server\n")
+		serverLogger.Info("server has been gracefully stopped")
+	case <-time.After(5 * time.Second):
+		serverLogger.Warn("gracefull shutdown exceeded 5 sec, Stop() was needed")
 		server.Stop()
+	}
+
+	return runErr
+}
+
+func main() {
+	if err := run(); err != nil {
+		os.Exit(1)
 	}
 }
